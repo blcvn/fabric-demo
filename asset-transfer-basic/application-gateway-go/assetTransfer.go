@@ -1,9 +1,3 @@
-/*
-Copyright 2021 IBM All Rights Reserved.
-
-SPDX-License-Identifier: Apache-2.0
-*/
-
 package main
 
 import (
@@ -20,12 +14,12 @@ import (
 	"github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-gateway/pkg/hash"
 	"github.com/hyperledger/fabric-gateway/pkg/identity"
-	"github.com/hyperledger/fabric-protos-go-apiv2/gateway"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 )
 
+// Các hằng số cho kết nối và thông tin peer
 const (
 	mspID        = "Org1MSP"
 	cryptoPath   = "../../test-network/organizations/peerOrganizations/org1.example.com"
@@ -37,23 +31,21 @@ const (
 )
 
 var now = time.Now()
-var assetId = fmt.Sprintf("asset%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
 
 func main() {
-	// The gRPC client connection should be shared by all Gateway connections to this endpoint
+	// Tạo kết nối gRPC
 	clientConnection := newGrpcConnection()
 	defer clientConnection.Close()
 
 	id := newIdentity()
 	sign := newSign()
 
-	// Create a Gateway connection for a specific client identity
+	// Tạo kết nối Gateway với Identity
 	gw, err := client.Connect(
 		id,
 		client.WithSign(sign),
 		client.WithHash(hash.SHA256),
 		client.WithClientConnection(clientConnection),
-		// Default timeouts for different gRPC calls
 		client.WithEvaluateTimeout(5*time.Second),
 		client.WithEndorseTimeout(15*time.Second),
 		client.WithSubmitTimeout(5*time.Second),
@@ -64,7 +56,7 @@ func main() {
 	}
 	defer gw.Close()
 
-	// Override default values for chaincode and channel name as they may differ in testing contexts.
+	// Cài đặt các tên channel và chaincode
 	chaincodeName := "basic"
 	if ccname := os.Getenv("CHAINCODE_NAME"); ccname != "" {
 		chaincodeName = ccname
@@ -78,15 +70,17 @@ func main() {
 	network := gw.GetNetwork(channelName)
 	contract := network.GetContract(chaincodeName)
 
+	// Các giao dịch với contract
 	initLedger(contract)
-	getAllAssets(contract)
-	createAsset(contract)
-	readAssetByID(contract)
-	transferAssetAsync(contract)
+	getAllAccounts(contract)
+	createAccount(contract)
+	readAccountByID(contract)
+	transferMoney(contract)
+	deductBalanceFromAccount(contract) // Gọi hàm trừ tiền từ tài khoản
 	exampleErrorHandling(contract)
 }
 
-// newGrpcConnection creates a gRPC connection to the Gateway server.
+// Tạo kết nối gRPC
 func newGrpcConnection() *grpc.ClientConn {
 	certificatePEM, err := os.ReadFile(tlsCertPath)
 	if err != nil {
@@ -102,7 +96,7 @@ func newGrpcConnection() *grpc.ClientConn {
 	certPool.AddCert(certificate)
 	transportCredentials := credentials.NewClientTLSFromCert(certPool, gatewayPeer)
 
-	connection, err := grpc.NewClient(peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
+	connection, err := grpc.Dial(peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
 	if err != nil {
 		panic(fmt.Errorf("failed to create gRPC connection: %w", err))
 	}
@@ -110,7 +104,7 @@ func newGrpcConnection() *grpc.ClientConn {
 	return connection
 }
 
-// newIdentity creates a client identity for this Gateway connection using an X.509 certificate.
+// Tạo Identity
 func newIdentity() *identity.X509Identity {
 	certificatePEM, err := readFirstFile(certPath)
 	if err != nil {
@@ -130,7 +124,7 @@ func newIdentity() *identity.X509Identity {
 	return id
 }
 
-// newSign creates a function that generates a digital signature from a message digest using a private key.
+// Tạo Sign function
 func newSign() identity.Sign {
 	privateKeyPEM, err := readFirstFile(keyPath)
 	if err != nil {
@@ -150,6 +144,7 @@ func newSign() identity.Sign {
 	return sign
 }
 
+// Đọc tệp đầu tiên trong thư mục
 func readFirstFile(dirPath string) ([]byte, error) {
 	dir, err := os.Open(dirPath)
 	if err != nil {
@@ -164,10 +159,9 @@ func readFirstFile(dirPath string) ([]byte, error) {
 	return os.ReadFile(path.Join(dirPath, fileNames[0]))
 }
 
-// This type of transaction would typically only be run once by an application the first time it was started after its
-// initial deployment. A new version of the chaincode deployed later would likely not need to run an "init" function.
+// Tạo ledger ban đầu
 func initLedger(contract *client.Contract) {
-	fmt.Printf("\n--> Submit Transaction: InitLedger, function creates the initial set of assets on the ledger \n")
+	fmt.Printf("\n--> Submit Transaction: InitLedger, function creates the initial set of accounts on the ledger\n")
 
 	_, err := contract.SubmitTransaction("InitLedger")
 	if err != nil {
@@ -177,11 +171,11 @@ func initLedger(contract *client.Contract) {
 	fmt.Printf("*** Transaction committed successfully\n")
 }
 
-// Evaluate a transaction to query ledger state.
-func getAllAssets(contract *client.Contract) {
-	fmt.Println("\n--> Evaluate Transaction: GetAllAssets, function returns all the current assets on the ledger")
+// Lấy tất cả tài khoản
+func getAllAccounts(contract *client.Contract) {
+	fmt.Println("\n--> Evaluate Transaction: GetAllAccounts, function returns all the accounts in the ledger")
 
-	evaluateResult, err := contract.EvaluateTransaction("GetAllAssets")
+	evaluateResult, err := contract.EvaluateTransaction("GetAllAccounts")
 	if err != nil {
 		panic(fmt.Errorf("failed to evaluate transaction: %w", err))
 	}
@@ -190,11 +184,12 @@ func getAllAssets(contract *client.Contract) {
 	fmt.Printf("*** Result:%s\n", result)
 }
 
-// Submit a transaction synchronously, blocking until it has been committed to the ledger.
-func createAsset(contract *client.Contract) {
-	fmt.Printf("\n--> Submit Transaction: CreateAsset, creates new asset with ID, Color, Size, Owner and AppraisedValue arguments \n")
+// Tạo tài khoản mới
+func createAccount(contract *client.Contract) {
+	assetId := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
+	fmt.Printf("\n--> Submit Transaction: CreateAccount, creates a new account\n")
 
-	_, err := contract.SubmitTransaction("CreateAsset", assetId, "yellow", "5", "Tom", "1300")
+	_, err := contract.SubmitTransaction("CreateAccount", assetId)
 	if err != nil {
 		panic(fmt.Errorf("failed to submit transaction: %w", err))
 	}
@@ -202,11 +197,12 @@ func createAsset(contract *client.Contract) {
 	fmt.Printf("*** Transaction committed successfully\n")
 }
 
-// Evaluate a transaction by assetID to query ledger state.
-func readAssetByID(contract *client.Contract) {
-	fmt.Printf("\n--> Evaluate Transaction: ReadAsset, function returns asset attributes\n")
+// Đọc tài khoản theo ID
+func readAccountByID(contract *client.Contract) {
+	assetId := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
+	fmt.Printf("\n--> Evaluate Transaction: ReadAccount, function returns account details\n")
 
-	evaluateResult, err := contract.EvaluateTransaction("ReadAsset", assetId)
+	evaluateResult, err := contract.EvaluateTransaction("ReadAccount", assetId)
 	if err != nil {
 		panic(fmt.Errorf("failed to evaluate transaction: %w", err))
 	}
@@ -215,33 +211,49 @@ func readAssetByID(contract *client.Contract) {
 	fmt.Printf("*** Result:%s\n", result)
 }
 
-// Submit transaction asynchronously, blocking until the transaction has been sent to the orderer, and allowing
-// this thread to process the chaincode response (e.g. update a UI) without waiting for the commit notification
-func transferAssetAsync(contract *client.Contract) {
-	fmt.Printf("\n--> Async Submit Transaction: TransferAsset, updates existing asset owner")
+// Chuyển tiền giữa hai tài khoản
+func transferMoney(contract *client.Contract) {
+	fromAccountID := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
+	toAccountID := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
+	amount := 100.0
 
-	submitResult, commit, err := contract.SubmitAsync("TransferAsset", client.WithArguments(assetId, "Mark"))
+	fmt.Printf("\n--> Submit Transaction: TransferMoney, function transfers money between accounts\n")
+
+	_, err := contract.SubmitTransaction("TransferMoney", fromAccountID, toAccountID, fmt.Sprintf("%f", amount))
 	if err != nil {
-		panic(fmt.Errorf("failed to submit transaction asynchronously: %w", err))
-	}
-
-	fmt.Printf("\n*** Successfully submitted transaction to transfer ownership from %s to Mark. \n", string(submitResult))
-	fmt.Println("*** Waiting for transaction commit.")
-
-	if commitStatus, err := commit.Status(); err != nil {
-		panic(fmt.Errorf("failed to get commit status: %w", err))
-	} else if !commitStatus.Successful {
-		panic(fmt.Errorf("transaction %s failed to commit with status: %d", commitStatus.TransactionID, int32(commitStatus.Code)))
+		panic(fmt.Errorf("failed to submit transaction: %w", err))
 	}
 
 	fmt.Printf("*** Transaction committed successfully\n")
 }
 
-// Submit transaction, passing in the wrong number of arguments ,expected to throw an error containing details of any error responses from the smart contract.
-func exampleErrorHandling(contract *client.Contract) {
-	fmt.Println("\n--> Submit Transaction: UpdateAsset asset70, asset70 does not exist and should return an error")
+// DeductBalance safely deducts a specified amount from an account
+func deductBalance(contract *client.Contract, accountID string, amount float64) {
+	fmt.Printf("\n--> Submit Transaction: DeductBalance, function deducts money from account\n")
 
-	_, err := contract.SubmitTransaction("UpdateAsset", "asset70", "blue", "5", "Tomoko", "300")
+	// Submit transaction to deduct balance
+	_, err := contract.SubmitTransaction("DeductBalance", accountID, fmt.Sprintf("%f", amount))
+	if err != nil {
+		panic(fmt.Errorf("failed to submit transaction: %w", err))
+	}
+
+	fmt.Printf("*** Transaction committed successfully\n")
+}
+
+// Trừ tiền từ tài khoản
+func deductBalanceFromAccount(contract *client.Contract) {
+	accountID := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
+	amount := 50.0 // số tiền cần trừ
+
+	// Gọi hàm DeductBalance
+	deductBalance(contract, accountID, amount)
+}
+
+// Xử lý lỗi giao dịch
+func exampleErrorHandling(contract *client.Contract) {
+	fmt.Println("\n--> Submit Transaction: TransferMoney with insufficient balance")
+
+	_, err := contract.SubmitTransaction("TransferMoney", "account70", "account71", "300")
 	if err == nil {
 		panic("******** FAILED to return an error")
 	}
@@ -268,25 +280,9 @@ func exampleErrorHandling(contract *client.Contract) {
 	} else {
 		panic(fmt.Errorf("unexpected error type %T: %w", err, err))
 	}
-
-	// Any error that originates from a peer or orderer node external to the gateway will have its details
-	// embedded within the gRPC status error. The following code shows how to extract that.
-	statusErr := status.Convert(err)
-
-	details := statusErr.Details()
-	if len(details) > 0 {
-		fmt.Println("Error Details:")
-
-		for _, detail := range details {
-			switch detail := detail.(type) {
-			case *gateway.ErrorDetail:
-				fmt.Printf("- address: %s; mspId: %s; message: %s\n", detail.Address, detail.MspId, detail.Message)
-			}
-		}
-	}
 }
 
-// Format JSON data
+// Định dạng JSON để dễ đọc
 func formatJSON(data []byte) string {
 	var prettyJSON bytes.Buffer
 	if err := json.Indent(&prettyJSON, data, "", "  "); err != nil {
