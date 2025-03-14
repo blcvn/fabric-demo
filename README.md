@@ -30,12 +30,6 @@ echo $FABRIC_CFG_PATH
 cd ~/Hyperledger-Fabric/test-network
 ./network.sh down # Dừng network nếu đang chạy
 ./network.sh up createChannel -ca
-```
-
----
-
-## 4. Package Chaincode
-```sh
-cd /Users/phamkhanhlong/Hyperledger-Fabric/test-network
 peer lifecycle chaincode package basic.tar.gz --path ../asset-transfer-basic/chaincode-go --lang golang --label basic_1.0
+./network.sh deployCC -ccn basic -ccp ../asset-transfer-basic/chaincode-go -ccl go
 ```

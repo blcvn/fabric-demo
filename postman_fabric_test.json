@@ -100,7 +100,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\"from_account\": \"user123\", \"to_account\": \"user456\", \"amount\": 30.00}"
+          "raw": "{\"from_account\": \"user123\", \"to_account\": \"user456\", \"amount\": 300}"
         },
         "url": {
           "raw": "http://localhost:8080/transfer",

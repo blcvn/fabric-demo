@@ -121,7 +121,18 @@ func main() {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"account": string(result)})
+
+		// Parse kết quả từ blockchain thành đối tượng JSON
+		var account map[string]interface{}
+		if err := json.Unmarshal(result, &account); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse account data"})
+			return
+		}
+
+		// Trả về kết quả với định dạng đẹp
+		c.IndentedJSON(http.StatusOK, gin.H{
+			"account": account, // Hiển thị tài khoản
+		})
 	})
 
 	r.POST("/balance/deduct", func(c *gin.Context) {
@@ -133,11 +144,31 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		if err := deductBalance(contract, req.AccountID, req.Amount); err != nil {
+
+		beforeBalance, deductedAmount, afterBalance, err := deductBalance(contract, req.AccountID, req.Amount)
+		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"message": "Balance deducted successfully"})
+
+		// Tạo kết quả trả về theo định dạng yêu cầu
+		result := struct {
+			BeforeBalance float64 `json:"beforeBalance"`
+			Amount        float64 `json:"amount"`
+			AfterBalance  float64 `json:"afterBalance"`
+			Account       string  `json:"account"`
+		}{
+			BeforeBalance: beforeBalance,
+			Amount:        deductedAmount,
+			AfterBalance:  afterBalance,
+			Account:       req.AccountID,
+		}
+
+		// Trả về phản hồi theo định dạng
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Balance deducted successfully",
+			"results": []interface{}{result},
+		})
 	})
 
 	r.POST("/transfer", func(c *gin.Context) {
@@ -146,15 +177,36 @@ func main() {
 			ToAccount   string  `json:"to_account"`
 			Amount      float64 `json:"amount"`
 		}
+
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		if err := transferMoney(contract, req.FromAccount, req.ToAccount, req.Amount); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+
+		// Thực hiện giao dịch chuyển tiền
+		err := transferMoney(contract, req.FromAccount, req.ToAccount, req.Amount)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"message":       "Transfer failed",
+				"from_account":  req.FromAccount,
+				"to_account":    req.ToAccount,
+				"amount":        req.Amount,
+				"error_message": err.Error(),
+			})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"message": "Transfer successful"})
+
+		// Trả về kết quả giao dịch theo định dạng mong muốn
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Transfer successfully",
+			"results": []interface{}{
+				gin.H{
+					"from_account": req.FromAccount,
+					"amount":       req.Amount,
+					"to_account":   req.ToAccount,
+				},
+			},
+		})
 	})
 
 	r.GET("/accounts", func(c *gin.Context) {
@@ -246,9 +298,38 @@ func readAccount(contract *client.Contract, accountID string) ([]byte, error) {
 	return contract.EvaluateTransaction("ReadAccount", accountID)
 }
 
-func deductBalance(contract *client.Contract, accountID string, amount float64) error {
-	_, err := contract.SubmitTransaction("DeductBalance", accountID, fmt.Sprintf("%.2f", amount))
-	return err
+func deductBalance(contract *client.Contract, accountID string, amount float64) (float64, float64, float64, error) {
+	// Đọc số dư trước khi trừ tiền
+	beforeBalanceBytes, err := contract.EvaluateTransaction("ReadAccount", accountID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to get before balance: %v", err)
+	}
+
+	var beforeData map[string]interface{}
+	if err := json.Unmarshal(beforeBalanceBytes, &beforeData); err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to parse before balance JSON: %v", err)
+	}
+	beforeBalance := beforeData["balance"].(float64)
+
+	// Thực hiện giao dịch trừ tiền
+	_, err = contract.SubmitTransaction("DeductBalance", accountID, fmt.Sprintf("%.2f", amount))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to deduct balance: %v", err)
+	}
+
+	// Đọc lại số dư sau khi trừ tiền
+	afterBalanceBytes, err := contract.EvaluateTransaction("ReadAccount", accountID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to get after balance: %v", err)
+	}
+
+	var afterData map[string]interface{}
+	if err := json.Unmarshal(afterBalanceBytes, &afterData); err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to parse after balance JSON: %v", err)
+	}
+	afterBalance := afterData["balance"].(float64)
+
+	return beforeBalance, amount, afterBalance, nil
 }
 
 func transferMoney(contract *client.Contract, fromAccountID, toAccountID string, amount float64) error {
