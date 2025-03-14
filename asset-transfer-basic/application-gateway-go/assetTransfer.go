@@ -63,25 +63,47 @@ func main() {
 			return
 		}
 
+		type BalanceResult struct {
+			BeforeBalance float64 `json:"beforeBalance"`
+			Amount        float64 `json:"amount"`
+			AfterBalance  float64 `json:"afterBalance"`
+			Account       string  `json:"account"`
+		}
+
 		var wg sync.WaitGroup
 		errChan := make(chan error, len(req.Accounts))
+		resultChan := make(chan BalanceResult, len(req.Accounts))
 
 		for accountID, amount := range req.Accounts {
 			wg.Add(1)
 			go func(accID string, amt float64) {
 				defer wg.Done()
-				if err := addBalance(contract, accID, amt); err != nil {
+				beforeBalance, afterBalance, err := addBalance(contract, accID, amt)
+				if err != nil {
 					errChan <- fmt.Errorf("Account %s: %v", accID, err)
+					return
+				}
+				resultChan <- BalanceResult{
+					BeforeBalance: beforeBalance,
+					Amount:        amt,
+					AfterBalance:  afterBalance,
+					Account:       accID,
 				}
 			}(accountID, amount)
 		}
 
 		wg.Wait()
 		close(errChan)
+		close(resultChan)
 
 		var errors []string
+		var results []BalanceResult
+
 		for err := range errChan {
 			errors = append(errors, err.Error())
+		}
+		for result := range resultChan {
+			results = append(results, result)
 		}
 
 		if len(errors) > 0 {
@@ -89,7 +111,7 @@ func main() {
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{"message": "Batch transactions submitted successfully"})
+		c.JSON(http.StatusOK, gin.H{"message": "Batch transactions submitted successfully", "results": results})
 	})
 
 	r.GET("/account/:id", func(c *gin.Context) {
@@ -186,9 +208,38 @@ func createAccount(contract *client.Contract, accountID string) error {
 	return nil
 }
 
-func addBalance(contract *client.Contract, accountID string, amount float64) error {
-	_, err := contract.SubmitTransaction("AddBalance", accountID, fmt.Sprintf("%.2f", amount))
-	return err
+func addBalance(contract *client.Contract, accountID string, amount float64) (float64, float64, error) {
+	// Đọc số dư trước khi thêm tiền
+	beforeBalanceBytes, err := contract.EvaluateTransaction("ReadAccount", accountID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get before balance: %v", err)
+	}
+
+	var beforeData map[string]interface{}
+	if err := json.Unmarshal(beforeBalanceBytes, &beforeData); err != nil {
+		return 0, 0, fmt.Errorf("failed to parse before balance JSON: %v", err)
+	}
+	beforeBalance := beforeData["balance"].(float64)
+
+	// Thực hiện giao dịch thêm tiền
+	_, err = contract.SubmitTransaction("AddBalance", accountID, fmt.Sprintf("%.2f", amount))
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to add balance: %v", err)
+	}
+
+	// Đọc lại số dư sau khi thêm tiền
+	afterBalanceBytes, err := contract.EvaluateTransaction("ReadAccount", accountID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to get after balance: %v", err)
+	}
+
+	var afterData map[string]interface{}
+	if err := json.Unmarshal(afterBalanceBytes, &afterData); err != nil {
+		return 0, 0, fmt.Errorf("failed to parse after balance JSON: %v", err)
+	}
+	afterBalance := afterData["balance"].(float64)
+
+	return beforeBalance, afterBalance, nil
 }
 
 func readAccount(contract *client.Contract, accountID string) ([]byte, error) {
