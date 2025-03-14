@@ -18,54 +18,35 @@ type Account struct {
 	Balance   float64 `json:"balance"`
 }
 
-// CreateAccount issues a new account with given accountID.
 func (s *SmartContract) CreateAccount(ctx contractapi.TransactionContextInterface, accountID string) error {
-	exists, err := s.AccountExists(ctx, accountID)
+	accountData, err := ctx.GetStub().GetState(accountID)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read from world state: %v", err)
 	}
-	if exists {
-		return fmt.Errorf("the account %s already exists", accountID)
+	if accountData != nil {
+		return fmt.Errorf("account %s already exists", accountID)
 	}
 
-	account := Account{
-		AccountID: accountID,
-		Balance:   0,
-	}
-	accountJSON, err := json.Marshal(account)
-	if err != nil {
-		return err
-	}
-
+	account := Account{AccountID: accountID, Balance: 0}
+	accountJSON, _ := json.Marshal(account)
 	return ctx.GetStub().PutState(accountID, accountJSON)
 }
 
 // ReadAccount returns the account stored in world state
 func (s *SmartContract) ReadAccount(ctx contractapi.TransactionContextInterface, accountID string) (*Account, error) {
-	accountJSON, err := ctx.GetStub().GetState(accountID)
+	accountData, err := ctx.GetStub().GetState(accountID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read from world state: %v", err)
+		return nil, fmt.Errorf("failed to read world state: %v", err)
 	}
-	if accountJSON == nil {
-		return nil, fmt.Errorf("the account %s does not exist", accountID)
+	if accountData == nil {
+		return nil, fmt.Errorf("account %s does not exist", accountID)
 	}
 
 	var account Account
-	err = json.Unmarshal(accountJSON, &account)
-	if err != nil {
-		return nil, err
+	if err := json.Unmarshal(accountData, &account); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal account: %v", err)
 	}
-
 	return &account, nil
-}
-
-// AccountExists checks if account exists
-func (s *SmartContract) AccountExists(ctx contractapi.TransactionContextInterface, accountID string) (bool, error) {
-	accountJSON, err := ctx.GetStub().GetState(accountID)
-	if err != nil {
-		return false, fmt.Errorf("failed to read from world state: %v", err)
-	}
-	return accountJSON != nil, nil
 }
 
 // AddBalance safely adds a specified amount to an account
@@ -76,52 +57,8 @@ func (s *SmartContract) AddBalance(ctx contractapi.TransactionContextInterface, 
 	}
 
 	account.Balance += amount
-	accountJSON, err := json.Marshal(account)
-	if err != nil {
-		return fmt.Errorf("failed to marshal account: %v", err)
-	}
-
+	accountJSON, _ := json.Marshal(account)
 	return ctx.GetStub().PutState(accountID, accountJSON)
-}
-
-// TransferMoney transfers funds between two accounts safely
-func (s *SmartContract) TransferMoney(ctx contractapi.TransactionContextInterface, fromAccountID, toAccountID string, amount float64) error {
-	fromAccount, err := s.ReadAccount(ctx, fromAccountID)
-	if err != nil {
-		return err
-	}
-	if fromAccount.Balance < amount {
-		return fmt.Errorf("insufficient balance in fromAccount")
-	}
-
-	toAccount, err := s.ReadAccount(ctx, toAccountID)
-	if err != nil {
-		return fmt.Errorf("destination account does not exist")
-	}
-
-	// Deduct and add balances safely
-	fromAccount.Balance -= amount
-	toAccount.Balance += amount
-
-	fromAccountJSON, _ := json.Marshal(fromAccount)
-	toAccountJSON, _ := json.Marshal(toAccount)
-
-	// Atomic state update
-	err = ctx.GetStub().PutState(fromAccountID, fromAccountJSON)
-	if err != nil {
-		return fmt.Errorf("failed to update fromAccount: %v", err)
-	}
-
-	err = ctx.GetStub().PutState(toAccountID, toAccountJSON)
-	if err != nil {
-		// Rollback fromAccount balance
-		fromAccount.Balance += amount
-		rollbackJSON, _ := json.Marshal(fromAccount)
-		ctx.GetStub().PutState(fromAccountID, rollbackJSON)
-		return fmt.Errorf("failed to update toAccount: %v", err)
-	}
-
-	return nil
 }
 
 // DeductBalance safely deducts a specified amount from an account
@@ -131,16 +68,49 @@ func (s *SmartContract) DeductBalance(ctx contractapi.TransactionContextInterfac
 		return err
 	}
 	if account.Balance < amount {
-		return fmt.Errorf("insufficient balance in the account")
+		return fmt.Errorf("insufficient balance")
 	}
 
 	account.Balance -= amount
-	accountJSON, err := json.Marshal(account)
+	accountJSON, _ := json.Marshal(account)
+	return ctx.GetStub().PutState(accountID, accountJSON)
+}
+
+// TransferMoney transfers funds between two accounts safely
+func (s *SmartContract) TransferMoney(ctx contractapi.TransactionContextInterface, fromID, toID string, amount float64) error {
+	fromAccount, err := s.ReadAccount(ctx, fromID)
 	if err != nil {
-		return fmt.Errorf("failed to marshal account: %v", err)
+		return err
+	}
+	if fromAccount.Balance < amount {
+		return fmt.Errorf("insufficient balance in %s", fromID)
 	}
 
-	return ctx.GetStub().PutState(accountID, accountJSON)
+	toAccount, err := s.ReadAccount(ctx, toID)
+	if err != nil {
+		return fmt.Errorf("destination account %s does not exist", toID)
+	}
+
+	// Cập nhật số dư tài khoản
+	fromAccount.Balance -= amount
+	toAccount.Balance += amount
+
+	// Chuyển đổi dữ liệu JSON một lần
+	fromAccountJSON, _ := json.Marshal(fromAccount)
+	toAccountJSON, _ := json.Marshal(toAccount)
+
+	// Cập nhật cả hai tài khoản trong một transaction (batch update)
+	stub := ctx.GetStub()
+	err = stub.PutState(fromID, fromAccountJSON)
+	if err != nil {
+		return fmt.Errorf("failed to update fromAccount: %v", err)
+	}
+	err = stub.PutState(toID, toAccountJSON)
+	if err != nil {
+		return fmt.Errorf("failed to update toAccount: %v", err)
+	}
+
+	return nil
 }
 
 // GetAllAccounts returns all accounts in the world state

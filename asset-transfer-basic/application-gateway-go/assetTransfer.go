@@ -1,292 +1,240 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
+	"encoding/pem"
 	"fmt"
+	"log"
+	"net/http"
 	"os"
-	"path"
-	"time"
+	"path/filepath"
+	"sync"
 
+	"github.com/gin-gonic/gin"
 	"github.com/hyperledger/fabric-gateway/pkg/client"
-	"github.com/hyperledger/fabric-gateway/pkg/hash"
 	"github.com/hyperledger/fabric-gateway/pkg/identity"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/status"
 )
 
-// Các hằng số cho kết nối và thông tin peer
 const (
-	mspID        = "Org1MSP"
-	cryptoPath   = "../../test-network/organizations/peerOrganizations/org1.example.com"
-	certPath     = cryptoPath + "/users/User1@org1.example.com/msp/signcerts"
-	keyPath      = cryptoPath + "/users/User1@org1.example.com/msp/keystore"
-	tlsCertPath  = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
-	peerEndpoint = "dns:///localhost:7051"
-	gatewayPeer  = "peer0.org1.example.com"
+	mspID         = "Org1MSP"
+	cryptoPath    = "/home/lequocvieet/Desktop/longpk/fabric-demo/test-network/organizations/peerOrganizations/org1.example.com"
+	certPath      = cryptoPath + "/users/User1@org1.example.com/msp/signcerts/cert.pem"
+	keyPath       = cryptoPath + "/users/User1@org1.example.com/msp/keystore"
+	tlsCertPath   = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
+	peerEndpoint  = "localhost:7051"
+	channelName   = "mychannel"
+	chaincodeName = "basic"
 )
-
-var now = time.Now()
 
 func main() {
-	// Tạo kết nối gRPC
-	clientConnection := newGrpcConnection()
-	defer clientConnection.Close()
+	// Khởi tạo router Gin
+	r := gin.Default()
 
-	id := newIdentity()
-	sign := newSign()
-
-	// Tạo kết nối Gateway với Identity
-	gw, err := client.Connect(
-		id,
-		client.WithSign(sign),
-		client.WithHash(hash.SHA256),
-		client.WithClientConnection(clientConnection),
-		client.WithEvaluateTimeout(5*time.Second),
-		client.WithEndorseTimeout(15*time.Second),
-		client.WithSubmitTimeout(5*time.Second),
-		client.WithCommitStatusTimeout(1*time.Minute),
-	)
+	// Kết nối Fabric Gateway
+	gateway, err := connectToFabricGateway()
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to connect to Fabric Gateway: %v", err)
 	}
-	defer gw.Close()
+	defer gateway.Close()
 
-	// Cài đặt các tên channel và chaincode
-	chaincodeName := "basic"
-	if ccname := os.Getenv("CHAINCODE_NAME"); ccname != "" {
-		chaincodeName = ccname
-	}
-
-	channelName := "mychannel"
-	if cname := os.Getenv("CHANNEL_NAME"); cname != "" {
-		channelName = cname
-	}
-
-	network := gw.GetNetwork(channelName)
+	network := gateway.GetNetwork(channelName)
 	contract := network.GetContract(chaincodeName)
 
-	// Các giao dịch với contract
-	initLedger(contract)
-	getAllAccounts(contract)
-	createAccount(contract)
-	readAccountByID(contract)
-	transferMoney(contract)
-	deductBalanceFromAccount(contract) // Gọi hàm trừ tiền từ tài khoản
-	exampleErrorHandling(contract)
+	// Định nghĩa các API
+	r.POST("/account/:id", func(c *gin.Context) {
+		accountID := c.Param("id")
+		if err := createAccount(contract, accountID); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Account created successfully"})
+	})
+
+	r.POST("/balance/add-batch", func(c *gin.Context) {
+		var req struct {
+			Accounts map[string]float64 `json:"accounts"`
+		}
+
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(req.Accounts))
+
+		for accountID, amount := range req.Accounts {
+			wg.Add(1)
+			go func(accID string, amt float64) {
+				defer wg.Done()
+				if err := addBalance(contract, accID, amt); err != nil {
+					errChan <- fmt.Errorf("Account %s: %v", accID, err)
+				}
+			}(accountID, amount)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		var errors []string
+		for err := range errChan {
+			errors = append(errors, err.Error())
+		}
+
+		if len(errors) > 0 {
+			c.JSON(http.StatusInternalServerError, gin.H{"errors": errors})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"message": "Batch transactions submitted successfully"})
+	})
+
+	r.GET("/account/:id", func(c *gin.Context) {
+		accountID := c.Param("id")
+		result, err := readAccount(contract, accountID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"account": string(result)})
+	})
+
+	r.POST("/balance/deduct", func(c *gin.Context) {
+		var req struct {
+			AccountID string  `json:"account_id"`
+			Amount    float64 `json:"amount"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if err := deductBalance(contract, req.AccountID, req.Amount); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Balance deducted successfully"})
+	})
+
+	r.POST("/transfer", func(c *gin.Context) {
+		var req struct {
+			FromAccount string  `json:"from_account"`
+			ToAccount   string  `json:"to_account"`
+			Amount      float64 `json:"amount"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if err := transferMoney(contract, req.FromAccount, req.ToAccount, req.Amount); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Transfer successful"})
+	})
+
+	r.GET("/accounts", func(c *gin.Context) {
+		result, err := getAllAccounts(contract)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		var accounts []map[string]interface{}
+		if err := json.Unmarshal(result, &accounts); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse JSON response"})
+			return
+		}
+
+		c.IndentedJSON(http.StatusOK, gin.H{"accounts": accounts}) // Dùng IndentedJSON để format đẹp hơn
+	})
+
+	// Chạy server trên cổng 8080
+	r.Run(":8080")
 }
 
-// Tạo kết nối gRPC
+func connectToFabricGateway() (*client.Gateway, error) {
+	clientConnection := newGrpcConnection()
+
+	id, err := newIdentity()
+	if err != nil {
+		return nil, err
+	}
+
+	sign := newSigner()
+
+	gateway, err := client.Connect(id, client.WithSign(sign), client.WithClientConnection(clientConnection))
+	if err != nil {
+		return nil, err
+	}
+
+	return gateway, nil
+}
+
+// === Các hàm gọi transaction ===
+
+func createAccount(contract *client.Contract, accountID string) error {
+	_, err := contract.SubmitTransaction("CreateAccount", accountID)
+	if err != nil {
+		if err.Error() == "rpc error: code = Aborted desc = failed to endorse transaction, see attached details for more info" {
+			return fmt.Errorf("Account %s already exit", accountID)
+		}
+		return err
+	}
+	return nil
+}
+
+func addBalance(contract *client.Contract, accountID string, amount float64) error {
+	_, err := contract.SubmitTransaction("AddBalance", accountID, fmt.Sprintf("%.2f", amount))
+	return err
+}
+
+func readAccount(contract *client.Contract, accountID string) ([]byte, error) {
+	return contract.EvaluateTransaction("ReadAccount", accountID)
+}
+
+func deductBalance(contract *client.Contract, accountID string, amount float64) error {
+	_, err := contract.SubmitTransaction("DeductBalance", accountID, fmt.Sprintf("%.2f", amount))
+	return err
+}
+
+func transferMoney(contract *client.Contract, fromAccountID, toAccountID string, amount float64) error {
+	_, err := contract.SubmitTransaction("TransferMoney", fromAccountID, toAccountID, fmt.Sprintf("%.2f", amount))
+	return err
+}
+
+func getAllAccounts(contract *client.Contract) ([]byte, error) {
+	return contract.EvaluateTransaction("GetAllAccounts")
+}
+
+// === Kết nối gRPC ===
 func newGrpcConnection() *grpc.ClientConn {
-	certificatePEM, err := os.ReadFile(tlsCertPath)
-	if err != nil {
-		panic(fmt.Errorf("failed to read TLS certifcate file: %w", err))
-	}
-
-	certificate, err := identity.CertificateFromPEM(certificatePEM)
-	if err != nil {
-		panic(err)
-	}
-
 	certPool := x509.NewCertPool()
-	certPool.AddCert(certificate)
-	transportCredentials := credentials.NewClientTLSFromCert(certPool, gatewayPeer)
+	caCert, _ := os.ReadFile(tlsCertPath)
+	certPool.AppendCertsFromPEM(caCert)
 
+	transportCredentials := credentials.NewClientTLSFromCert(certPool, "")
 	connection, err := grpc.Dial(peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
 	if err != nil {
-		panic(fmt.Errorf("failed to create gRPC connection: %w", err))
+		log.Fatalf("Failed to create gRPC connection: %v", err)
 	}
-
 	return connection
 }
 
-// Tạo Identity
-func newIdentity() *identity.X509Identity {
-	certificatePEM, err := readFirstFile(certPath)
-	if err != nil {
-		panic(fmt.Errorf("failed to read certificate file: %w", err))
-	}
-
-	certificate, err := identity.CertificateFromPEM(certificatePEM)
-	if err != nil {
-		panic(err)
-	}
-
-	id, err := identity.NewX509Identity(mspID, certificate)
-	if err != nil {
-		panic(err)
-	}
-
-	return id
+// === Xác thực danh tính ===
+func newIdentity() (*identity.X509Identity, error) {
+	certBytes, _ := os.ReadFile(certPath)
+	block, _ := pem.Decode(certBytes)
+	cert, _ := x509.ParseCertificate(block.Bytes)
+	return identity.NewX509Identity(mspID, cert)
 }
 
-// Tạo Sign function
-func newSign() identity.Sign {
-	privateKeyPEM, err := readFirstFile(keyPath)
-	if err != nil {
-		panic(fmt.Errorf("failed to read private key file: %w", err))
-	}
-
-	privateKey, err := identity.PrivateKeyFromPEM(privateKeyPEM)
-	if err != nil {
-		panic(err)
-	}
-
-	sign, err := identity.NewPrivateKeySign(privateKey)
-	if err != nil {
-		panic(err)
-	}
-
-	return sign
-}
-
-// Đọc tệp đầu tiên trong thư mục
-func readFirstFile(dirPath string) ([]byte, error) {
-	dir, err := os.Open(dirPath)
-	if err != nil {
-		return nil, err
-	}
-
-	fileNames, err := dir.Readdirnames(1)
-	if err != nil {
-		return nil, err
-	}
-
-	return os.ReadFile(path.Join(dirPath, fileNames[0]))
-}
-
-// Tạo ledger ban đầu
-func initLedger(contract *client.Contract) {
-	fmt.Printf("\n--> Submit Transaction: InitLedger, function creates the initial set of accounts on the ledger\n")
-
-	_, err := contract.SubmitTransaction("InitLedger")
-	if err != nil {
-		panic(fmt.Errorf("failed to submit transaction: %w", err))
-	}
-
-	fmt.Printf("*** Transaction committed successfully\n")
-}
-
-// Lấy tất cả tài khoản
-func getAllAccounts(contract *client.Contract) {
-	fmt.Println("\n--> Evaluate Transaction: GetAllAccounts, function returns all the accounts in the ledger")
-
-	evaluateResult, err := contract.EvaluateTransaction("GetAllAccounts")
-	if err != nil {
-		panic(fmt.Errorf("failed to evaluate transaction: %w", err))
-	}
-	result := formatJSON(evaluateResult)
-
-	fmt.Printf("*** Result:%s\n", result)
-}
-
-// Tạo tài khoản mới
-func createAccount(contract *client.Contract) {
-	assetId := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
-	fmt.Printf("\n--> Submit Transaction: CreateAccount, creates a new account\n")
-
-	_, err := contract.SubmitTransaction("CreateAccount", assetId)
-	if err != nil {
-		panic(fmt.Errorf("failed to submit transaction: %w", err))
-	}
-
-	fmt.Printf("*** Transaction committed successfully\n")
-}
-
-// Đọc tài khoản theo ID
-func readAccountByID(contract *client.Contract) {
-	assetId := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
-	fmt.Printf("\n--> Evaluate Transaction: ReadAccount, function returns account details\n")
-
-	evaluateResult, err := contract.EvaluateTransaction("ReadAccount", assetId)
-	if err != nil {
-		panic(fmt.Errorf("failed to evaluate transaction: %w", err))
-	}
-	result := formatJSON(evaluateResult)
-
-	fmt.Printf("*** Result:%s\n", result)
-}
-
-// Chuyển tiền giữa hai tài khoản
-func transferMoney(contract *client.Contract) {
-	fromAccountID := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
-	toAccountID := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
-	amount := 100.0
-
-	fmt.Printf("\n--> Submit Transaction: TransferMoney, function transfers money between accounts\n")
-
-	_, err := contract.SubmitTransaction("TransferMoney", fromAccountID, toAccountID, fmt.Sprintf("%f", amount))
-	if err != nil {
-		panic(fmt.Errorf("failed to submit transaction: %w", err))
-	}
-
-	fmt.Printf("*** Transaction committed successfully\n")
-}
-
-// DeductBalance safely deducts a specified amount from an account
-func deductBalance(contract *client.Contract, accountID string, amount float64) {
-	fmt.Printf("\n--> Submit Transaction: DeductBalance, function deducts money from account\n")
-
-	// Submit transaction to deduct balance
-	_, err := contract.SubmitTransaction("DeductBalance", accountID, fmt.Sprintf("%f", amount))
-	if err != nil {
-		panic(fmt.Errorf("failed to submit transaction: %w", err))
-	}
-
-	fmt.Printf("*** Transaction committed successfully\n")
-}
-
-// Trừ tiền từ tài khoản
-func deductBalanceFromAccount(contract *client.Contract) {
-	accountID := fmt.Sprintf("account%d", now.Unix()*1e3+int64(now.Nanosecond())/1e6)
-	amount := 50.0 // số tiền cần trừ
-
-	// Gọi hàm DeductBalance
-	deductBalance(contract, accountID, amount)
-}
-
-// Xử lý lỗi giao dịch
-func exampleErrorHandling(contract *client.Contract) {
-	fmt.Println("\n--> Submit Transaction: TransferMoney with insufficient balance")
-
-	_, err := contract.SubmitTransaction("TransferMoney", "account70", "account71", "300")
-	if err == nil {
-		panic("******** FAILED to return an error")
-	}
-
-	fmt.Println("*** Successfully caught the error:")
-
-	var endorseErr *client.EndorseError
-	var submitErr *client.SubmitError
-	var commitStatusErr *client.CommitStatusError
-	var commitErr *client.CommitError
-
-	if errors.As(err, &endorseErr) {
-		fmt.Printf("Endorse error for transaction %s with gRPC status %v: %s\n", endorseErr.TransactionID, status.Code(endorseErr), endorseErr)
-	} else if errors.As(err, &submitErr) {
-		fmt.Printf("Submit error for transaction %s with gRPC status %v: %s\n", submitErr.TransactionID, status.Code(submitErr), submitErr)
-	} else if errors.As(err, &commitStatusErr) {
-		if errors.Is(err, context.DeadlineExceeded) {
-			fmt.Printf("Timeout waiting for transaction %s commit status: %s", commitStatusErr.TransactionID, commitStatusErr)
-		} else {
-			fmt.Printf("Error obtaining commit status for transaction %s with gRPC status %v: %s\n", commitStatusErr.TransactionID, status.Code(commitStatusErr), commitStatusErr)
-		}
-	} else if errors.As(err, &commitErr) {
-		fmt.Printf("Transaction %s failed to commit with status %d: %s\n", commitErr.TransactionID, int32(commitErr.Code), err)
-	} else {
-		panic(fmt.Errorf("unexpected error type %T: %w", err, err))
-	}
-}
-
-// Định dạng JSON để dễ đọc
-func formatJSON(data []byte) string {
-	var prettyJSON bytes.Buffer
-	if err := json.Indent(&prettyJSON, data, "", "  "); err != nil {
-		panic(fmt.Errorf("failed to parse JSON: %w", err))
-	}
-	return prettyJSON.String()
+func newSigner() identity.Sign {
+	keyFiles, _ := os.ReadDir(keyPath)
+	keyBytes, _ := os.ReadFile(filepath.Join(keyPath, keyFiles[0].Name()))
+	privateKey, _ := identity.PrivateKeyFromPEM(keyBytes)
+	signer, _ := identity.NewPrivateKeySign(privateKey)
+	return signer
 }
