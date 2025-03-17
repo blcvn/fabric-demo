@@ -20,7 +20,7 @@ import (
 
 const (
 	mspID         = "Org1MSP"
-	cryptoPath    = "/home/lequocvieet/Desktop/longpk/fabric-demo/test-network/organizations/peerOrganizations/org1.example.com"
+	cryptoPath    = "../../../fabric-demo/test-network/organizations/peerOrganizations/org1.example.com"
 	certPath      = cryptoPath + "/users/User1@org1.example.com/msp/signcerts/cert.pem"
 	keyPath       = cryptoPath + "/users/User1@org1.example.com/msp/keystore"
 	tlsCertPath   = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
@@ -80,7 +80,7 @@ func main() {
 				defer wg.Done()
 				beforeBalance, afterBalance, err := addBalance(contract, accID, amt)
 				if err != nil {
-					errChan <- fmt.Errorf("Account %s: %v", accID, err)
+					errChan <- fmt.Errorf("account %s: %v", accID, err)
 					return
 				}
 				resultChan <- BalanceResult{
@@ -171,41 +171,76 @@ func main() {
 		})
 	})
 
-	r.POST("/transfer", func(c *gin.Context) {
+	r.POST("/transfer-multiple", func(c *gin.Context) {
 		var req struct {
-			FromAccount string  `json:"from_account"`
-			ToAccount   string  `json:"to_account"`
-			Amount      float64 `json:"amount"`
+			FromAccount string             `json:"from_account" binding:"required"`
+			Transfers   map[string]float64 `json:"transfers" binding:"required"`
 		}
 
+		// Kiểm tra request JSON
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
 			return
 		}
 
-		// Thực hiện giao dịch chuyển tiền
-		err := transferMoney(contract, req.FromAccount, req.ToAccount, req.Amount)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"message":       "Transfer failed",
-				"from_account":  req.FromAccount,
-				"to_account":    req.ToAccount,
-				"amount":        req.Amount,
-				"error_message": err.Error(),
-			})
+		if len(req.Transfers) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Transfers list cannot be empty"})
 			return
 		}
 
-		// Trả về kết quả giao dịch theo định dạng mong muốn
-		c.JSON(http.StatusOK, gin.H{
-			"message": "Transfer successfully",
-			"results": []interface{}{
-				gin.H{
+		// Kết quả giao dịch
+		var wg sync.WaitGroup
+		errChan := make(chan error, len(req.Transfers))
+		resultChan := make(chan map[string]interface{}, len(req.Transfers))
+
+		for toAccount, amount := range req.Transfers {
+			wg.Add(1)
+			go func(toAcc string, amt float64) {
+				defer wg.Done()
+
+				// Gửi transaction đến Hyperledger Fabric
+				err := transferMoneyToMultiple(contract, req.FromAccount, map[string]float64{toAcc: amt})
+				if err != nil {
+					errChan <- fmt.Errorf("failed to transfer %.2f from %s to %s: %v", amt, req.FromAccount, toAcc, err)
+					return
+				}
+
+				// Nếu thành công, gửi kết quả vào channel
+				resultChan <- map[string]interface{}{
 					"from_account": req.FromAccount,
-					"amount":       req.Amount,
-					"to_account":   req.ToAccount,
-				},
-			},
+					"to_account":   toAcc,
+					"amount":       amt,
+					"status":       "success",
+				}
+			}(toAccount, amount)
+		}
+
+		// Đợi tất cả goroutines hoàn thành
+		wg.Wait()
+		close(errChan)
+		close(resultChan)
+
+		// Tổng hợp kết quả
+		var errors []string
+		var results []map[string]interface{}
+
+		for err := range errChan {
+			errors = append(errors, err.Error())
+		}
+		for result := range resultChan {
+			results = append(results, result)
+		}
+
+		// Nếu có lỗi, trả về response lỗi
+		if len(errors) > 0 {
+			c.JSON(http.StatusInternalServerError, gin.H{"errors": errors, "results": results})
+			return
+		}
+
+		// Trả về phản hồi thành công
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Transfer completed",
+			"results": results,
 		})
 	})
 
@@ -253,7 +288,7 @@ func createAccount(contract *client.Contract, accountID string) error {
 	_, err := contract.SubmitTransaction("CreateAccount", accountID)
 	if err != nil {
 		if err.Error() == "rpc error: code = Aborted desc = failed to endorse transaction, see attached details for more info" {
-			return fmt.Errorf("Account %s already exit", accountID)
+			return fmt.Errorf("account %s already exit", accountID)
 		}
 		return err
 	}
@@ -332,13 +367,24 @@ func deductBalance(contract *client.Contract, accountID string, amount float64) 
 	return beforeBalance, amount, afterBalance, nil
 }
 
-func transferMoney(contract *client.Contract, fromAccountID, toAccountID string, amount float64) error {
-	_, err := contract.SubmitTransaction("TransferMoney", fromAccountID, toAccountID, fmt.Sprintf("%.2f", amount))
+func transferMoneyToMultiple(contract *client.Contract, fromAccountID string, transfers map[string]float64) error {
+	transferData, _ := json.Marshal(transfers)
+	_, err := contract.SubmitTransaction("TransferMoneyToMultiple", fromAccountID, string(transferData))
 	return err
 }
 
 func getAllAccounts(contract *client.Contract) ([]byte, error) {
-	return contract.EvaluateTransaction("GetAllAccounts")
+	result, err := contract.EvaluateTransaction("GetAllAccounts")
+	if err != nil {
+		return nil, err
+	}
+
+	var accounts []map[string]interface{}
+	if err := json.Unmarshal(result, &accounts); err != nil {
+		return nil, fmt.Errorf("unexpected response format: %s", string(result))
+	}
+
+	return result, nil
 }
 
 // === Kết nối gRPC ===

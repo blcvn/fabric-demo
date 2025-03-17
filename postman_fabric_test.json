@@ -89,7 +89,7 @@
       }
     },
     {
-      "name": "Transfer Money",
+      "name": "Transfer Money to Multiple Accounts",
       "request": {
         "method": "POST",
         "header": [
@@ -100,14 +100,14 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\"from_account\": \"user123\", \"to_account\": \"user456\", \"amount\": 300}"
+          "raw": "{\"from_account\": \"user123\", \"transfers\": {\"user456\": 300, \"user789\": 200}}"
         },
         "url": {
-          "raw": "http://localhost:8080/transfer",
+          "raw": "http://localhost:8080/transfer-multiple",
           "protocol": "http",
           "host": ["localhost"],
           "port": "8080",
-          "path": ["transfer"]
+          "path": ["transfer-multiple"]
         }
       }
     },
