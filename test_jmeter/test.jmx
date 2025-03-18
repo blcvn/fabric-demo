@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.5">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Credit Account Load Test" enabled="true">
+      <hashTree>
+        <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="User Threads" enabled="true">
+          <stringProp name="ThreadGroup.num_threads">10</stringProp>  <!-- Số user đồng thời -->
+          <stringProp name="ThreadGroup.ramp_time">5</stringProp>  <!-- Thời gian tăng tải -->
+          <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+            <stringProp name="LoopController.loops">-1</stringProp>  <!-- Lặp vô hạn -->
+          </elementProp>
+          <hashTree>
+            <!-- Load CSV -->
+            <CSVDataSet guiclass="TestBeanGUI" testclass="CSVDataSet" testname="Load Account Data" enabled="true">
+              <stringProp name="filename">accounts.csv</stringProp>
+              <stringProp name="variableNames">accountID,amount</stringProp>
+              <boolProp name="ignoreFirstLine">true</boolProp>
+              <boolProp name="recycle">true</boolProp>
+              <boolProp name="stopThread">false</boolProp>
+              <stringProp name="delimiter">,</stringProp>
+            </CSVDataSet>
+            <!-- HTTP Request -->
+            <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="Credit Account" enabled="true">
+              <stringProp name="HTTPSampler.domain">localhost</stringProp>
+              <stringProp name="HTTPSampler.port">3000</stringProp>
+              <stringProp name="HTTPSampler.protocol">http</stringProp>
+              <stringProp name="HTTPSampler.path">/addBalance</stringProp>
+              <stringProp name="HTTPSampler.method">POST</stringProp>
+              <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+                <collectionProp name="Arguments.arguments">
+                  <elementProp name="accountID" elementType="HTTPArgument">
+                    <stringProp name="Argument.name">accountID</stringProp>
+                    <stringProp name="Argument.value">${accountID}</stringProp>
+                  </elementProp>
+                  <elementProp name="amount" elementType="HTTPArgument">
+                    <stringProp name="Argument.name">amount</stringProp>
+                    <stringProp name="Argument.value">${amount}</stringProp>
+                  </elementProp>
+                </collectionProp>
+              </elementProp>
+            </HTTPSamplerProxy>
+            <!-- View Results -->
+            <ResultCollector guiclass="ViewResultsTreeGui" testclass="ResultCollector" testname="View Results Tree" enabled="true"/>
+          </hashTree>
+        </ThreadGroup>
+      </hashTree>
+    </TestPlan>
+  </hashTree>
+</jmeterTestPlan>

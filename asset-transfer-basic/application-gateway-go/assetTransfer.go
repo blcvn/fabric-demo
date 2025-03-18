@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/hyperledger/fabric-gateway/pkg/client"
@@ -26,14 +25,14 @@ const (
 	tlsCertPath   = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
 	peerEndpoint  = "localhost:7051"
 	channelName   = "mychannel"
-	chaincodeName = "basic"
+	chaincodeName = "basic" // Đổi tên chaincode nếu cần
 )
 
 func main() {
 	// Khởi tạo router Gin
 	r := gin.Default()
 
-	// Kết nối Fabric Gateway
+	// Kết nối tới Fabric Gateway
 	gateway, err := connectToFabricGateway()
 	if err != nil {
 		log.Fatalf("Failed to connect to Fabric Gateway: %v", err)
@@ -43,98 +42,75 @@ func main() {
 	network := gateway.GetNetwork(channelName)
 	contract := network.GetContract(chaincodeName)
 
-	// Định nghĩa các API
+	// API tạo tài khoản
 	r.POST("/account/:id", func(c *gin.Context) {
 		accountID := c.Param("id")
-		if err := createAccount(contract, accountID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		_, err := contract.SubmitTransaction("CreateAccount", accountID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create account: %v", err)})
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "Account created successfully"})
 	})
 
-	r.POST("/balance/add-batch", func(c *gin.Context) {
+	// API thêm tiền vào tài khoản
+	r.POST("/balance/add", func(c *gin.Context) {
 		var req struct {
-			Accounts map[string]float64 `json:"accounts"`
+			AccountID string  `json:"account_id"`
+			Amount    float64 `json:"amount"`
 		}
-
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 
-		type BalanceResult struct {
-			BeforeBalance float64 `json:"beforeBalance"`
-			Amount        float64 `json:"amount"`
-			AfterBalance  float64 `json:"afterBalance"`
-			Account       string  `json:"account"`
-		}
-
-		var wg sync.WaitGroup
-		errChan := make(chan error, len(req.Accounts))
-		resultChan := make(chan BalanceResult, len(req.Accounts))
-
-		for accountID, amount := range req.Accounts {
-			wg.Add(1)
-			go func(accID string, amt float64) {
-				defer wg.Done()
-				beforeBalance, afterBalance, err := addBalance(contract, accID, amt)
-				if err != nil {
-					errChan <- fmt.Errorf("account %s: %v", accID, err)
-					return
-				}
-				resultChan <- BalanceResult{
-					BeforeBalance: beforeBalance,
-					Amount:        amt,
-					AfterBalance:  afterBalance,
-					Account:       accID,
-				}
-			}(accountID, amount)
-		}
-
-		wg.Wait()
-		close(errChan)
-		close(resultChan)
-
-		var errors []string
-		var results []BalanceResult
-
-		for err := range errChan {
-			errors = append(errors, err.Error())
-		}
-		for result := range resultChan {
-			results = append(results, result)
-		}
-
-		if len(errors) > 0 {
-			c.JSON(http.StatusInternalServerError, gin.H{"errors": errors})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{"message": "Batch transactions submitted successfully", "results": results})
-	})
-
-	r.GET("/account/:id", func(c *gin.Context) {
-		accountID := c.Param("id")
-		result, err := readAccount(contract, accountID)
+		// Lấy số dư hiện tại trước khi thêm tiền
+		result, err := contract.EvaluateTransaction("ReadAccount", req.AccountID)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read account: %v", err)})
 			return
 		}
-
-		// Parse kết quả từ blockchain thành đối tượng JSON
-		var account map[string]interface{}
+		var account struct {
+			Balance float64 `json:"balance"`
+		}
 		if err := json.Unmarshal(result, &account); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse account data"})
 			return
 		}
+		beforeBalance := account.Balance
 
-		// Trả về kết quả với định dạng đẹp
-		c.IndentedJSON(http.StatusOK, gin.H{
-			"account": account, // Hiển thị tài khoản
+		// Chuyển đổi amount thành chuỗi (với định dạng có 2 số thập phân)
+		amtStr := fmt.Sprintf("%.2f", req.Amount)
+		_, err = contract.SubmitTransaction("AddBalance", req.AccountID, amtStr)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to add balance: %v", err)})
+			return
+		}
+
+		// Tính toán số dư sau khi thêm tiền
+		afterBalance := beforeBalance + req.Amount
+
+		// Tạo cấu trúc kết quả
+		resultData := struct {
+			BeforeBalance float64 `json:"beforeBalance"`
+			Amount        float64 `json:"amount"`
+			AfterBalance  float64 `json:"afterBalance"`
+			Account       string  `json:"account"`
+		}{
+			BeforeBalance: beforeBalance,
+			Amount:        req.Amount,
+			AfterBalance:  afterBalance,
+			Account:       req.AccountID,
+		}
+
+		// Trả về phản hồi theo định dạng
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Balance added successfully",
+			"results": []interface{}{resultData},
 		})
 	})
 
+	// API trừ tiền khỏi tài khoản
 	r.POST("/balance/deduct", func(c *gin.Context) {
 		var req struct {
 			AccountID string  `json:"account_id"`
@@ -145,21 +121,47 @@ func main() {
 			return
 		}
 
-		beforeBalance, deductedAmount, afterBalance, err := deductBalance(contract, req.AccountID, req.Amount)
+		// Lấy số dư hiện tại trước khi trừ tiền
+		result, err := contract.EvaluateTransaction("ReadAccount", req.AccountID)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read account: %v", err)})
+			return
+		}
+		var account struct {
+			Balance float64 `json:"balance"`
+		}
+		if err := json.Unmarshal(result, &account); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse account data"})
+			return
+		}
+		beforeBalance := account.Balance
+
+		// Kiểm tra nếu số dư hiện tại nhỏ hơn số tiền cần trừ
+		if beforeBalance < req.Amount {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Insufficient balance"})
 			return
 		}
 
-		// Tạo kết quả trả về theo định dạng yêu cầu
-		result := struct {
+		// Chuyển đổi amount thành chuỗi (với định dạng có 2 số thập phân)
+		amtStr := fmt.Sprintf("%.2f", req.Amount)
+		_, err = contract.SubmitTransaction("DeductBalance", req.AccountID, amtStr)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to deduct balance: %v", err)})
+			return
+		}
+
+		// Tính toán số dư sau khi trừ tiền
+		afterBalance := beforeBalance - req.Amount
+
+		// Tạo cấu trúc kết quả
+		resultData := struct {
 			BeforeBalance float64 `json:"beforeBalance"`
 			Amount        float64 `json:"amount"`
 			AfterBalance  float64 `json:"afterBalance"`
 			Account       string  `json:"account"`
 		}{
 			BeforeBalance: beforeBalance,
-			Amount:        deductedAmount,
+			Amount:        req.Amount,
 			AfterBalance:  afterBalance,
 			Account:       req.AccountID,
 		}
@@ -167,103 +169,76 @@ func main() {
 		// Trả về phản hồi theo định dạng
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Balance deducted successfully",
-			"results": []interface{}{result},
+			"results": []interface{}{resultData},
 		})
 	})
 
+	// API chuyển tiền từ một tài khoản sang nhiều tài khoản
 	r.POST("/transfer-multiple", func(c *gin.Context) {
 		var req struct {
 			FromAccount string             `json:"from_account" binding:"required"`
 			Transfers   map[string]float64 `json:"transfers" binding:"required"`
 		}
-
-		// Kiểm tra request JSON
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
 			return
 		}
-
 		if len(req.Transfers) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Transfers list cannot be empty"})
 			return
 		}
 
-		// Kết quả giao dịch
-		var wg sync.WaitGroup
-		errChan := make(chan error, len(req.Transfers))
-		resultChan := make(chan map[string]interface{}, len(req.Transfers))
-
-		for toAccount, amount := range req.Transfers {
-			wg.Add(1)
-			go func(toAcc string, amt float64) {
-				defer wg.Done()
-
-				// Gửi transaction đến Hyperledger Fabric
-				err := transferMoneyToMultiple(contract, req.FromAccount, map[string]float64{toAcc: amt})
-				if err != nil {
-					errChan <- fmt.Errorf("failed to transfer %.2f from %s to %s: %v", amt, req.FromAccount, toAcc, err)
-					return
-				}
-
-				// Nếu thành công, gửi kết quả vào channel
-				resultChan <- map[string]interface{}{
-					"from_account": req.FromAccount,
-					"to_account":   toAcc,
-					"amount":       amt,
-					"status":       "success",
-				}
-			}(toAccount, amount)
-		}
-
-		// Đợi tất cả goroutines hoàn thành
-		wg.Wait()
-		close(errChan)
-		close(resultChan)
-
-		// Tổng hợp kết quả
-		var errors []string
-		var results []map[string]interface{}
-
-		for err := range errChan {
-			errors = append(errors, err.Error())
-		}
-		for result := range resultChan {
-			results = append(results, result)
-		}
-
-		// Nếu có lỗi, trả về response lỗi
-		if len(errors) > 0 {
-			c.JSON(http.StatusInternalServerError, gin.H{"errors": errors, "results": results})
+		// Chuyển map transfers thành JSON string
+		transferData, err := json.Marshal(req.Transfers)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to marshal transfers: %v", err)})
 			return
 		}
 
-		// Trả về phản hồi thành công
-		c.JSON(http.StatusOK, gin.H{
-			"message": "Transfer completed",
-			"results": results,
-		})
+		_, err = contract.SubmitTransaction("TransferMoneyToMultiple", req.FromAccount, string(transferData))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to transfer money: %v", err)})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Transfer completed successfully"})
 	})
 
-	r.GET("/accounts", func(c *gin.Context) {
-		result, err := getAllAccounts(contract)
+	// API đọc thông tin một tài khoản
+	r.GET("/account/:id", func(c *gin.Context) {
+		accountID := c.Param("id")
+		result, err := contract.EvaluateTransaction("ReadAccount", accountID)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read account: %v", err)})
 			return
 		}
+		var account map[string]interface{}
+		if err := json.Unmarshal(result, &account); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse account data"})
+			return
+		}
+		c.IndentedJSON(http.StatusOK, gin.H{"account": account})
+	})
 
+	// API lấy danh sách tất cả tài khoản
+	r.GET("/accounts", func(c *gin.Context) {
+		result, err := contract.EvaluateTransaction("GetAllAccounts")
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to get accounts: %v", err)})
+			return
+		}
 		var accounts []map[string]interface{}
 		if err := json.Unmarshal(result, &accounts); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse JSON response"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse accounts data"})
 			return
 		}
-
-		c.IndentedJSON(http.StatusOK, gin.H{"accounts": accounts}) // Dùng IndentedJSON để format đẹp hơn
+		c.IndentedJSON(http.StatusOK, gin.H{"accounts": accounts})
 	})
 
 	// Chạy server trên cổng 8080
 	r.Run(":8080")
 }
 
+// Hàm kết nối tới Fabric Gateway thông qua gRPC
 func connectToFabricGateway() (*client.Gateway, error) {
 	clientConnection := newGrpcConnection()
 
@@ -274,124 +249,24 @@ func connectToFabricGateway() (*client.Gateway, error) {
 
 	sign := newSigner()
 
-	gateway, err := client.Connect(id, client.WithSign(sign), client.WithClientConnection(clientConnection))
+	gw, err := client.Connect(id, client.WithSign(sign), client.WithClientConnection(clientConnection))
 	if err != nil {
 		return nil, err
 	}
 
-	return gateway, nil
+	return gw, nil
 }
 
-// === Các hàm gọi transaction ===
-
-func createAccount(contract *client.Contract, accountID string) error {
-	_, err := contract.SubmitTransaction("CreateAccount", accountID)
-	if err != nil {
-		if err.Error() == "rpc error: code = Aborted desc = failed to endorse transaction, see attached details for more info" {
-			return fmt.Errorf("account %s already exit", accountID)
-		}
-		return err
-	}
-	return nil
-}
-
-func addBalance(contract *client.Contract, accountID string, amount float64) (float64, float64, error) {
-	// Đọc số dư trước khi thêm tiền
-	beforeBalanceBytes, err := contract.EvaluateTransaction("ReadAccount", accountID)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get before balance: %v", err)
-	}
-
-	var beforeData map[string]interface{}
-	if err := json.Unmarshal(beforeBalanceBytes, &beforeData); err != nil {
-		return 0, 0, fmt.Errorf("failed to parse before balance JSON: %v", err)
-	}
-	beforeBalance := beforeData["balance"].(float64)
-
-	// Thực hiện giao dịch thêm tiền
-	_, err = contract.SubmitTransaction("AddBalance", accountID, fmt.Sprintf("%.2f", amount))
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to add balance: %v", err)
-	}
-
-	// Đọc lại số dư sau khi thêm tiền
-	afterBalanceBytes, err := contract.EvaluateTransaction("ReadAccount", accountID)
-	if err != nil {
-		return 0, 0, fmt.Errorf("failed to get after balance: %v", err)
-	}
-
-	var afterData map[string]interface{}
-	if err := json.Unmarshal(afterBalanceBytes, &afterData); err != nil {
-		return 0, 0, fmt.Errorf("failed to parse after balance JSON: %v", err)
-	}
-	afterBalance := afterData["balance"].(float64)
-
-	return beforeBalance, afterBalance, nil
-}
-
-func readAccount(contract *client.Contract, accountID string) ([]byte, error) {
-	return contract.EvaluateTransaction("ReadAccount", accountID)
-}
-
-func deductBalance(contract *client.Contract, accountID string, amount float64) (float64, float64, float64, error) {
-	// Đọc số dư trước khi trừ tiền
-	beforeBalanceBytes, err := contract.EvaluateTransaction("ReadAccount", accountID)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to get before balance: %v", err)
-	}
-
-	var beforeData map[string]interface{}
-	if err := json.Unmarshal(beforeBalanceBytes, &beforeData); err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to parse before balance JSON: %v", err)
-	}
-	beforeBalance := beforeData["balance"].(float64)
-
-	// Thực hiện giao dịch trừ tiền
-	_, err = contract.SubmitTransaction("DeductBalance", accountID, fmt.Sprintf("%.2f", amount))
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to deduct balance: %v", err)
-	}
-
-	// Đọc lại số dư sau khi trừ tiền
-	afterBalanceBytes, err := contract.EvaluateTransaction("ReadAccount", accountID)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to get after balance: %v", err)
-	}
-
-	var afterData map[string]interface{}
-	if err := json.Unmarshal(afterBalanceBytes, &afterData); err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to parse after balance JSON: %v", err)
-	}
-	afterBalance := afterData["balance"].(float64)
-
-	return beforeBalance, amount, afterBalance, nil
-}
-
-func transferMoneyToMultiple(contract *client.Contract, fromAccountID string, transfers map[string]float64) error {
-	transferData, _ := json.Marshal(transfers)
-	_, err := contract.SubmitTransaction("TransferMoneyToMultiple", fromAccountID, string(transferData))
-	return err
-}
-
-func getAllAccounts(contract *client.Contract) ([]byte, error) {
-	result, err := contract.EvaluateTransaction("GetAllAccounts")
-	if err != nil {
-		return nil, err
-	}
-
-	var accounts []map[string]interface{}
-	if err := json.Unmarshal(result, &accounts); err != nil {
-		return nil, fmt.Errorf("unexpected response format: %s", string(result))
-	}
-
-	return result, nil
-}
-
-// === Kết nối gRPC ===
+// Kết nối gRPC đến peer
 func newGrpcConnection() *grpc.ClientConn {
 	certPool := x509.NewCertPool()
-	caCert, _ := os.ReadFile(tlsCertPath)
-	certPool.AppendCertsFromPEM(caCert)
+	caCert, err := os.ReadFile(tlsCertPath)
+	if err != nil {
+		log.Fatalf("Failed to read TLS certificate: %v", err)
+	}
+	if !certPool.AppendCertsFromPEM(caCert) {
+		log.Fatalf("Failed to append TLS certificate")
+	}
 
 	transportCredentials := credentials.NewClientTLSFromCert(certPool, "")
 	connection, err := grpc.Dial(peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
@@ -401,18 +276,47 @@ func newGrpcConnection() *grpc.ClientConn {
 	return connection
 }
 
-// === Xác thực danh tính ===
+// Tạo danh tính (identity) từ file certificate
 func newIdentity() (*identity.X509Identity, error) {
-	certBytes, _ := os.ReadFile(certPath)
+	certBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read certificate file: %v", err)
+	}
+
 	block, _ := pem.Decode(certBytes)
-	cert, _ := x509.ParseCertificate(block.Bytes)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM block from certificate")
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse X.509 certificate: %v", err)
+	}
+
 	return identity.NewX509Identity(mspID, cert)
 }
 
+// Tạo signer từ private key
 func newSigner() identity.Sign {
-	keyFiles, _ := os.ReadDir(keyPath)
-	keyBytes, _ := os.ReadFile(filepath.Join(keyPath, keyFiles[0].Name()))
-	privateKey, _ := identity.PrivateKeyFromPEM(keyBytes)
-	signer, _ := identity.NewPrivateKeySign(privateKey)
+	keyFiles, err := os.ReadDir(keyPath)
+	if err != nil || len(keyFiles) == 0 {
+		log.Fatalf("Failed to read private key directory: %v", err)
+	}
+
+	keyBytes, err := os.ReadFile(filepath.Join(keyPath, keyFiles[0].Name()))
+	if err != nil {
+		log.Fatalf("Failed to read private key file: %v", err)
+	}
+
+	privateKey, err := identity.PrivateKeyFromPEM(keyBytes)
+	if err != nil {
+		log.Fatalf("Failed to parse private key: %v", err)
+	}
+
+	signer, err := identity.NewPrivateKeySign(privateKey)
+	if err != nil {
+		log.Fatalf("Failed to create signer: %v", err)
+	}
+
 	return signer
 }

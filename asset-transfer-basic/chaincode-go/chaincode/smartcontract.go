@@ -3,7 +3,11 @@ package chaincode
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
+	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
 )
@@ -19,16 +23,38 @@ type Account struct {
 	Balance   float64 `json:"balance"`
 }
 
-// Map để quản lý các khóa tài khoản, đảm bảo an toàn khi giao dịch đồng thời
 var accountLocks sync.Map
 
-// getLock lấy mutex cho một tài khoản cụ thể
 func getLock(accountID string) *sync.Mutex {
 	lock, _ := accountLocks.LoadOrStore(accountID, &sync.Mutex{})
 	return lock.(*sync.Mutex)
 }
 
-// CreateAccount tạo tài khoản mới với số dư ban đầu là 0
+// putStateWithRetry thực hiện ghi trạng thái với retry nếu gặp lỗi MVCC hoặc lỗi đồng thời.
+func putStateWithRetry(ctx contractapi.TransactionContextInterface, key string, value []byte) error {
+	maxRetries := 5
+	var err error
+	stub := ctx.GetStub()
+
+	for i := 0; i < maxRetries; i++ {
+		err = stub.PutState(key, value)
+		if err == nil || (!isMVCCConflict(err) && !isConcurrencyError(err)) {
+			return err
+		}
+		// Chờ một khoảng thời gian ngẫu nhiên để tránh xung đột liên tục
+		time.Sleep(time.Duration(rand.Intn(100)+50) * time.Millisecond)
+	}
+	return err
+}
+
+func isMVCCConflict(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "MVCC_READ_CONFLICT")
+}
+
+func isConcurrencyError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "concurrent transaction")
+}
+
 func (s *SmartContract) CreateAccount(ctx contractapi.TransactionContextInterface, accountID string) error {
 	existingAccount, err := ctx.GetStub().GetState(accountID)
 	if err != nil {
@@ -39,11 +65,14 @@ func (s *SmartContract) CreateAccount(ctx contractapi.TransactionContextInterfac
 	}
 
 	account := Account{AccountID: accountID, Balance: 0}
-	accountJSON, _ := json.Marshal(account)
-	return ctx.GetStub().PutState(accountID, accountJSON)
+	accountJSON, err := json.Marshal(account)
+	if err != nil {
+		return fmt.Errorf("failed to marshal account JSON: %v", err)
+	}
+	// Sử dụng putStateWithRetry để giảm khả năng lỗi MVCC
+	return putStateWithRetry(ctx, accountID, accountJSON)
 }
 
-// ReadAccount lấy thông tin tài khoản từ world state
 func (s *SmartContract) ReadAccount(ctx contractapi.TransactionContextInterface, accountID string) (*Account, error) {
 	accountData, err := ctx.GetStub().GetState(accountID)
 	if err != nil {
@@ -60,8 +89,11 @@ func (s *SmartContract) ReadAccount(ctx contractapi.TransactionContextInterface,
 	return &account, nil
 }
 
-// AddBalance thêm tiền vào tài khoản
 func (s *SmartContract) AddBalance(ctx contractapi.TransactionContextInterface, accountID string, amount float64) error {
+	if amount <= 0 {
+		return fmt.Errorf("amount must be greater than zero")
+	}
+
 	lock := getLock(accountID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -72,12 +104,18 @@ func (s *SmartContract) AddBalance(ctx contractapi.TransactionContextInterface, 
 	}
 
 	account.Balance += amount
-	accountJSON, _ := json.Marshal(account)
-	return ctx.GetStub().PutState(accountID, accountJSON)
+	accountJSON, err := json.Marshal(account)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated account JSON: %v", err)
+	}
+	return putStateWithRetry(ctx, accountID, accountJSON)
 }
 
-// DeductBalance trừ tiền khỏi tài khoản
 func (s *SmartContract) DeductBalance(ctx contractapi.TransactionContextInterface, accountID string, amount float64) error {
+	if amount <= 0 {
+		return fmt.Errorf("amount must be greater than zero")
+	}
+
 	lock := getLock(accountID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -91,24 +129,49 @@ func (s *SmartContract) DeductBalance(ctx contractapi.TransactionContextInterfac
 	}
 
 	account.Balance -= amount
-	accountJSON, _ := json.Marshal(account)
-	return ctx.GetStub().PutState(accountID, accountJSON)
+	accountJSON, err := json.Marshal(account)
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated account JSON: %v", err)
+	}
+	return putStateWithRetry(ctx, accountID, accountJSON)
 }
 
-// TransferMoneyToMultiple chuyển tiền từ một tài khoản nguồn đến nhiều tài khoản đích
 func (s *SmartContract) TransferMoneyToMultiple(ctx contractapi.TransactionContextInterface, fromID string, transfers map[string]float64) error {
-	fromLock := getLock(fromID)
-	fromLock.Lock()
-	defer fromLock.Unlock()
+	if len(transfers) == 0 {
+		return fmt.Errorf("no transfer targets provided")
+	}
 
+	// Lấy danh sách tài khoản cần khóa
+	accountIDs := make([]string, 0, len(transfers)+1)
+	accountIDs = append(accountIDs, fromID)
+	for toID := range transfers {
+		accountIDs = append(accountIDs, toID)
+	}
+	sort.Strings(accountIDs) // Sắp xếp để tránh deadlock
+
+	// Khóa tất cả tài khoản theo thứ tự
+	locks := make([]*sync.Mutex, len(accountIDs))
+	for i, accID := range accountIDs {
+		locks[i] = getLock(accID)
+		locks[i].Lock()
+	}
+	defer func() {
+		for _, lock := range locks {
+			lock.Unlock()
+		}
+	}()
+
+	// Đọc tài khoản nguồn
 	fromAccount, err := s.ReadAccount(ctx, fromID)
 	if err != nil {
 		return err
 	}
 
-	// Tính tổng số tiền cần chuyển
 	totalAmount := 0.0
 	for _, amount := range transfers {
+		if amount <= 0 {
+			return fmt.Errorf("transfer amount must be greater than zero")
+		}
 		totalAmount += amount
 	}
 
@@ -116,64 +179,37 @@ func (s *SmartContract) TransferMoneyToMultiple(ctx contractapi.TransactionConte
 		return fmt.Errorf("insufficient balance in %s", fromID)
 	}
 
-	// Trừ tiền khỏi tài khoản nguồn trước khi thực hiện giao dịch
+	// Cập nhật tài khoản nguồn
 	fromAccount.Balance -= totalAmount
-	stub := ctx.GetStub()
-	if fromAccountJSON, err := json.Marshal(fromAccount); err == nil {
-		if err := stub.PutState(fromID, fromAccountJSON); err != nil {
-			return fmt.Errorf("failed to update fromAccount: %v", err)
-		}
-	} else {
-		return fmt.Errorf("failed to marshal fromAccount: %v", err)
+	fromAccountJSON, err := json.Marshal(fromAccount)
+	if err != nil {
+		return fmt.Errorf("failed to marshal sender account JSON: %v", err)
+	}
+	if err := putStateWithRetry(ctx, fromID, fromAccountJSON); err != nil {
+		return fmt.Errorf("failed to update sender account: %v", err)
 	}
 
-	// Thực hiện cập nhật số dư tài khoản đích bằng Goroutine
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var transferErr error
-
+	// Cập nhật số dư các tài khoản nhận
 	for toID, amount := range transfers {
-		wg.Add(1)
-		go func(toID string, amount float64) {
-			defer wg.Done()
-			toLock := getLock(toID)
-			toLock.Lock()
-			defer toLock.Unlock()
+		toAccount, err := s.ReadAccount(ctx, toID)
+		if err != nil {
+			// Nếu tài khoản chưa tồn tại, tạo mới
+			toAccount = &Account{AccountID: toID, Balance: 0}
+		}
 
-			account, err := s.ReadAccount(ctx, toID)
-			if err != nil {
-				mu.Lock()
-				transferErr = fmt.Errorf("destination account %s does not exist", toID)
-				mu.Unlock()
-				return
-			}
-
-			account.Balance += amount
-
-			if toAccountJSON, err := json.Marshal(account); err == nil {
-				if err := stub.PutState(toID, toAccountJSON); err != nil {
-					mu.Lock()
-					transferErr = fmt.Errorf("failed to update toAccount %s: %v", toID, err)
-					mu.Unlock()
-				}
-			} else {
-				mu.Lock()
-				transferErr = fmt.Errorf("failed to marshal toAccount %s: %v", toID, err)
-				mu.Unlock()
-			}
-		}(toID, amount)
-	}
-
-	wg.Wait()
-
-	if transferErr != nil {
-		return transferErr
+		toAccount.Balance += amount
+		toAccountJSON, err := json.Marshal(toAccount)
+		if err != nil {
+			return fmt.Errorf("failed to marshal recipient account JSON for %s: %v", toID, err)
+		}
+		if err := putStateWithRetry(ctx, toID, toAccountJSON); err != nil {
+			return fmt.Errorf("failed to update recipient account %s: %v", toID, err)
+		}
 	}
 
 	return nil
 }
 
-// GetAllAccounts lấy tất cả tài khoản trong world state
 func (s *SmartContract) GetAllAccounts(ctx contractapi.TransactionContextInterface) ([]*Account, error) {
 	resultsIterator, err := ctx.GetStub().GetStateByRange("", "")
 	if err != nil {

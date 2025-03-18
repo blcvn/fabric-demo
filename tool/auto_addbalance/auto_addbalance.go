@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	baseURL = "http://localhost:8080/balance/add-batch"
+	baseURL = "http://localhost:8080/balance/add"
 )
 
 type BalanceRequest struct {
