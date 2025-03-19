@@ -1,0 +1,67 @@
+{
+  "info": {
+    "_postman_id": "12345678-1234-5678-1234-567812345678",
+    "name": "Fabric Gateway API Test",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Create Account",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": { "raw": "http://localhost:8080/account/acc1", "host": ["http://localhost:8080"], "path": ["account", "acc1"] }
+      }
+    },
+    {
+      "name": "Add Balance",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{ \"account_id\": \"acc1\", \"amount\": 100 }" },
+        "url": { "raw": "http://localhost:8080/balance/add", "host": ["http://localhost:8080"], "path": ["balance", "add"] }
+      }
+    },
+    {
+      "name": "Deduct Balance",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{ \"account_id\": \"acc1\", \"amount\": 50 }" },
+        "url": { "raw": "http://localhost:8080/balance/deduct", "host": ["http://localhost:8080"], "path": ["balance", "deduct"] }
+      }
+    },
+    {
+      "name": "Transfer Balance",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{ \"from_account\": \"acc1\", \"to_account\": \"acc2\", \"amount\": 30 }"
+        },
+        "url": {
+          "raw": "http://localhost:8080/transfer",
+          "host": ["http://localhost:8080"],
+          "path": ["transfer"]
+        }
+      }
+    },
+    {
+      "name": "Read Account",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "http://localhost:8080/account/acc1", "host": ["http://localhost:8080"], "path": ["account", "acc1"] }
+      }
+    },
+    {
+      "name": "Get All Accounts",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": { "raw": "http://localhost:8080/accounts", "host": ["http://localhost:8080"], "path": ["accounts"] }
+      }
+    }
+  ]
+}

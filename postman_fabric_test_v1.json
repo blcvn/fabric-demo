@@ -103,7 +103,7 @@
           "raw": "{\"from_account\": \"user123\", \"transfers\": {\"user456\": 300, \"user789\": 200}}"
         },
         "url": {
-          "raw": "http://localhost:8080/transfer-multiple",
+          "raw": "http://localhost:8080/transfer",
           "protocol": "http",
           "host": ["localhost"],
           "port": "8080",

@@ -2,20 +2,27 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 )
 
 const baseURL = "http://localhost:8080/account/"
+
+var (
+	mu       sync.Mutex
+	accounts [][]string
+)
 
 func createAccount(accountID int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	url := fmt.Sprintf("%s%d", baseURL, accountID)
 	requestBody, _ := json.Marshal(map[string]string{
-		"account_id": fmt.Sprintf("user%d", accountID),
+		"account_id": fmt.Sprintf("%d", accountID), // Không thêm "user"
 	})
 
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(requestBody))
@@ -25,11 +32,31 @@ func createAccount(accountID int, wg *sync.WaitGroup) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
-		fmt.Printf("[SUCCESS] Account %d created successfully\n", accountID)
-	} else {
-		fmt.Printf("[FAIL] Account %d failed with status: %d\n", accountID, resp.StatusCode)
+	// Lưu accountID vào danh sách mà không có status
+	mu.Lock()
+	accounts = append(accounts, []string{fmt.Sprintf("%d", accountID)})
+	mu.Unlock()
+
+	fmt.Printf("[INFO] Processed account %d\n", accountID)
+}
+
+func saveToCSV(filename string) {
+	file, err := os.Create(filename)
+	if err != nil {
+		fmt.Println("Error creating CSV file:", err)
+		return
 	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Ghi tiêu đề cột
+	writer.Write([]string{"account_id"})
+
+	// Ghi dữ liệu
+	writer.WriteAll(accounts)
+	fmt.Println("CSV file saved:", filename)
 }
 
 func main() {
@@ -39,5 +66,9 @@ func main() {
 		go createAccount(i, &wg)
 	}
 	wg.Wait()
+
+	// Lưu vào file CSV
+	saveToCSV("accounts.csv")
+
 	fmt.Println("All account creation requests completed.")
 }

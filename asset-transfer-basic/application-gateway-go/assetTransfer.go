@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/hyperledger/fabric-gateway/pkg/client"
@@ -113,9 +114,11 @@ func main() {
 	// API trừ tiền khỏi tài khoản
 	r.POST("/balance/deduct", func(c *gin.Context) {
 		var req struct {
-			AccountID string  `json:"account_id"`
-			Amount    float64 `json:"amount"`
+			AccountID string  `json:"account_id" binding:"required"`
+			Amount    float64 `json:"amount" binding:"required,gt=0"`
 		}
+
+		// Kiểm tra dữ liệu đầu vào
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -124,9 +127,14 @@ func main() {
 		// Lấy số dư hiện tại trước khi trừ tiền
 		result, err := contract.EvaluateTransaction("ReadAccount", req.AccountID)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to read account: %v", err)})
+			if strings.Contains(err.Error(), "does not exist") {
+				c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("Account %s not found", req.AccountID)})
+			} else {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to read account: %v", err)})
+			}
 			return
 		}
+
 		var account struct {
 			Balance float64 `json:"balance"`
 		}
@@ -134,73 +142,130 @@ func main() {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse account data"})
 			return
 		}
-		beforeBalance := account.Balance
+		beforeDeduct := account.Balance
 
 		// Kiểm tra nếu số dư hiện tại nhỏ hơn số tiền cần trừ
-		if beforeBalance < req.Amount {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Insufficient balance"})
+		if beforeDeduct < req.Amount {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Insufficient funds"})
 			return
 		}
 
-		// Chuyển đổi amount thành chuỗi (với định dạng có 2 số thập phân)
+		// Gọi Smart Contract để trừ tiền
 		amtStr := fmt.Sprintf("%.2f", req.Amount)
 		_, err = contract.SubmitTransaction("DeductBalance", req.AccountID, amtStr)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to deduct balance: %v", err)})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to deduct funds: %v", err)})
 			return
 		}
 
 		// Tính toán số dư sau khi trừ tiền
-		afterBalance := beforeBalance - req.Amount
+		afterDeduct := beforeDeduct - req.Amount
 
 		// Tạo cấu trúc kết quả
 		resultData := struct {
-			BeforeBalance float64 `json:"beforeBalance"`
-			Amount        float64 `json:"amount"`
-			AfterBalance  float64 `json:"afterBalance"`
-			Account       string  `json:"account"`
+			BeforeDeduct float64 `json:"beforeDeduct"`
+			Amount       float64 `json:"amount"`
+			AfterDeduct  float64 `json:"afterDeduct"`
+			Account      string  `json:"account"`
 		}{
-			BeforeBalance: beforeBalance,
-			Amount:        req.Amount,
-			AfterBalance:  afterBalance,
-			Account:       req.AccountID,
+			BeforeDeduct: beforeDeduct,
+			Amount:       req.Amount,
+			AfterDeduct:  afterDeduct,
+			Account:      req.AccountID,
 		}
 
-		// Trả về phản hồi theo định dạng
+		// Trả về phản hồi
 		c.JSON(http.StatusOK, gin.H{
-			"message": "Balance deducted successfully",
+			"message": "Deduction successful",
 			"results": []interface{}{resultData},
 		})
 	})
 
 	// API chuyển tiền từ một tài khoản sang nhiều tài khoản
-	r.POST("/transfer-multiple", func(c *gin.Context) {
+	r.POST("/transfer", func(c *gin.Context) {
 		var req struct {
-			FromAccount string             `json:"from_account" binding:"required"`
-			Transfers   map[string]float64 `json:"transfers" binding:"required"`
+			FromAccount string  `json:"from_account" binding:"required"`
+			ToAccount   string  `json:"to_account" binding:"required"`
+			Amount      float64 `json:"amount" binding:"required,gt=0"`
 		}
+
+		// Kiểm tra dữ liệu đầu vào
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format"})
-			return
-		}
-		if len(req.Transfers) == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Transfers list cannot be empty"})
-			return
-		}
-
-		// Chuyển map transfers thành JSON string
-		transferData, err := json.Marshal(req.Transfers)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to marshal transfers: %v", err)})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "Invalid request format. Ensure 'from_account', 'to_account' (strings) and 'amount' (positive number) are provided.",
+				"details": err.Error(),
+			})
 			return
 		}
 
-		_, err = contract.SubmitTransaction("TransferMoneyToMultiple", req.FromAccount, string(transferData))
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to transfer money: %v", err)})
+		// Kiểm tra nếu người gửi và người nhận giống nhau
+		if req.FromAccount == req.ToAccount {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot transfer to the same account"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"message": "Transfer completed successfully"})
+
+		// Lấy số dư tài khoản nguồn trước khi chuyển khoản
+		fromAccountData, err := contract.EvaluateTransaction("ReadAccount", req.FromAccount)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to read sender account: %v", err)})
+			return
+		}
+
+		var fromAccount struct {
+			Balance float64 `json:"balance"`
+		}
+		if err := json.Unmarshal(fromAccountData, &fromAccount); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse sender account data"})
+			return
+		}
+
+		// Kiểm tra số dư
+		if fromAccount.Balance < req.Amount {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Insufficient funds in sender account"})
+			return
+		}
+
+		// Thực hiện giao dịch chuyển tiền
+		_, err = contract.SubmitTransaction("Transfer", req.FromAccount, req.ToAccount, fmt.Sprintf("%.2f", req.Amount))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to transfer funds: %v", err)})
+			return
+		}
+
+		// Lấy số dư tài khoản sau giao dịch
+		toAccountData, err := contract.EvaluateTransaction("ReadAccount", req.ToAccount)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to read recipient account: %v", err)})
+			return
+		}
+
+		var toAccount struct {
+			Balance float64 `json:"balance"`
+		}
+		if err := json.Unmarshal(toAccountData, &toAccount); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse recipient account data"})
+			return
+		}
+
+		// Trả về phản hồi chi tiết
+		resultData := struct {
+			FromAccount   string  `json:"fromAccount"`
+			ToAccount     string  `json:"toAccount"`
+			Amount        float64 `json:"amount"`
+			BeforeBalance float64 `json:"beforeBalance"`
+			AfterBalance  float64 `json:"afterBalance"`
+		}{
+			FromAccount:   req.FromAccount,
+			ToAccount:     req.ToAccount,
+			Amount:        req.Amount,
+			BeforeBalance: fromAccount.Balance,
+			AfterBalance:  fromAccount.Balance - req.Amount,
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Transfer completed successfully",
+			"results": resultData,
+		})
 	})
 
 	// API đọc thông tin một tài khoản
