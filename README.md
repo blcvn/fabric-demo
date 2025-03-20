@@ -90,15 +90,16 @@ account_id,amount
 }
 ```
 
-### 3. Chạy test
+### 4. Chạy test
 
 - Bấm **Start** và kiểm tra **View Results Tree** + **Summary Report**.
 
-### 4. Kết quả
+### 5. Kết quả
 
 - Số liệu test trên JMeter **Summary Report**
+![Ảnh ví dụ](./image/add_balance_jmeter.png)
 - URL: `http://your-api-host/balance/add`
-
+![Ảnh ví dụ](./image/add_balance.png)
 ---
 
 ## II. Kịch bản test Debit
@@ -145,11 +146,11 @@ account_id,amount
   "amount": ${amount}
 }
 ```
-### 3. Chạy test
+### 4. Chạy test
 
 - Bấm **Start** và kiểm tra **View Results Tree** + **Summary Report**.
 
-### 4. Kết quả
+### 5. Kết quả
 
 - Số liệu test trên JMeter **Summary Report**
 ![Ảnh ví dụ](./image/jmeter_deduct.png)
