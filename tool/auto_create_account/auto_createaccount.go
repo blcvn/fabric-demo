@@ -61,7 +61,7 @@ func saveToCSV(filename string) {
 
 func main() {
 	var wg sync.WaitGroup
-	for i := 1001; i <= 1100; i++ {
+	for i := 1; i <= 10000; i++ {
 		wg.Add(1)
 		go createAccount(i, &wg)
 	}
