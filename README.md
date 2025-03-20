@@ -24,7 +24,7 @@ echo $FABRIC_CFG_PATH
 
 ## 3. Khởi Chạy Mạng Thử Nghiệm
 ```sh
-cd test-network.
+cd test-network
 ./network.sh down 
 ./network.sh up createChannel -ca
 ./network.sh deployCC -ccn basic -ccp ../asset-transfer-basic/chaincode-go -ccl go
